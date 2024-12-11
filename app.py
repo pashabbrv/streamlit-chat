@@ -25,8 +25,8 @@ authenticator = stauth.Authenticate(
     config['cookie']['expiry_days']
 )
 
-API_URL = st.secrets["API"]["URL"]
-API_TOKEN = st.secrets["API"]["TOKEN"]
+API_URL = "https://api-inference.huggingface.co/models/csebuetnlp/mT5_multilingual_XLSum"
+API_TOKEN = "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"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
 # Класс сообщения
