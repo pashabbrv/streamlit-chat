@@ -1,0 +1,26 @@
+cookie:
+  expiry_days: 30
+  key: abcdef
+  name: auth
+credentials:
+  usernames:
+    jsmith:
+      email: jsmith@gmail.com
+      failed_login_attempts: 11
+      first_name: Джон
+      last_name: Смит
+      logged_in: false
+      password: abc
+      roles:
+      - админ
+      - редактор
+      - пользователь
+    rbriggs:
+      email: rbriggs@gmail.com
+      failed_login_attempts: 8
+      first_name: Ребекка
+      last_name: Бриггс
+      logged_in: false
+      password: abc1235SCD
+      roles:
+      - пользователь
