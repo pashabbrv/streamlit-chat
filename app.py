@@ -1,203 +1,465 @@
-from dataclasses import dataclass
-from typing import Literal
 import streamlit as st
-import streamlit.components.v1 as components
-import requests
-import streamlit_authenticator as stauth
 import yaml
 from yaml.loader import SafeLoader
+import streamlit_authenticator as stauth
+import sqlitecloud
+import re
+from model_api_utils import HuggingFaceAPIChain, resize_image, bytes_to_base64, base64_to_bytes, process_file_from_json
+from chat_history_utils import create_new_chat, save_chat, load_chat, list_chats, clear_chat
+from database_utils import update_user_params
+from folder_manager_utils import load_folders, add_folder, remove_folder, add_chat_to_folder, remove_chat_from_folder
+import time
 
+# Установка параметров страницы
 st.set_page_config(
-    page_title="Чат-бот LLM",
+    page_title="Чат-бот",
     page_icon="static/img/robot.png",
     layout="centered",
     initial_sidebar_state="collapsed",
     menu_items=None
 )
 
+# Настройка yaml и sqlite базы данных для работы со stauth
 with open('static/yaml/config.yaml', encoding='utf-8') as file:
     config = yaml.load(file, Loader=SafeLoader)
 
+database_connection = sqlitecloud.connect("sqlitecloud://cwhn6fmohk.g6.sqlite.cloud:8860/streamlit-app?apikey=J9RVuB0yk0yBtz2rcqar5m9GmdftlBq7ce03ryZYtH8")
+database_connection.execute("USE DATABASE streamlit-app")
+database_connection.row_factory = sqlitecloud.Row
+cursor = database_connection.execute("SELECT * FROM users")
+
+rows = cursor.fetchall()
+data = [dict(row) for row in rows]
+
+data_dict = {}
+for user in data:
+    data_dict[user['username']] = {
+        'email': user['email'],
+        'failed_login_attempts': user['failed_login_attempts'],
+        'first_name': user['first_name'],
+        'last_name': user['last_name'],
+        'logged_in': user['logged_in'],
+        'password': user['password'],
+        'password_hint': user['password_hint'],
+        'roles': user['roles'],
+        'theme_button': user.get('theme_button'),
+        'current_chat': user.get('current_chat'),
+        'selected_model': user.get('selected_model')
+    }
+
+# Преобразование data_dict в users_dict для корректной работы со StreamlitAuthenticator
+users_dict = {}
+users_dict['usernames'] = data_dict 
+
 authenticator = stauth.Authenticate(
-    config['credentials'],
+    users_dict,
     config['cookie']['name'],
     config['cookie']['key'],
     config['cookie']['expiry_days']
 )
 
-API_URL = "https://api-inference.huggingface.co/models/csebuetnlp/mT5_multilingual_XLSum"
-API_TOKEN = "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"
+# URL для HuggingFace API
+MISTRAL_URL = st.secrets["API"]["MISTRAL_URL"]
+XLSUM_URL = st.secrets["API"]["XLSUM_URL"]
+FLUX_URL = st.secrets["API"]["FLUX_URL"]
+API_TOKEN = st.secrets["API"]["TOKEN"]
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
-# Класс сообщения
-@dataclass
-class Message:
-    origin: Literal["human", "ai"]
-    message: str
+model_options = {
+    "Mistral": MISTRAL_URL,
+    "XLSum": XLSUM_URL,
+    "Flux": FLUX_URL
+}
 
-# Отправляет запрос к API Hugging Face и возвращает ответ модели
-def query_huggingface_api(prompt: str) -> str:
-    payload = {"inputs": prompt}
-    response = requests.post(API_URL, headers=HEADERS, json=payload)
-    if response.status_code == 200:
-        return response.json()[0]['summary_text']
-    else:
-        st.error(f"Ошибка API Hugging Face: {response.status_code}")
-        return "Ошибка при запросе к модели."
-
+# Функции подключения css и инициализации session_state
 def load_css():
     with open("static/css/styles.css", "r") as file:
         css = f"<style>{file.read()}</style>"
         st.markdown(css, unsafe_allow_html=True)
+        
+def initialize_session_state(username):
+    user_data = data_dict.get(username, {})
 
-def initialize_session_state():
-    if "history" not in st.session_state:
-        st.session_state.history = []
+    if 'messages' not in st.session_state:
+        st.session_state['messages'] = []
 
-def on_click_callback():
-    human_prompt = st.session_state.human_prompt
-    with spinner_placeholder.container():
-        with st.spinner("Обработка запроса"):
-            llm_response = query_huggingface_api(human_prompt)
-    st.session_state.history.append(Message("human", human_prompt))
-    st.session_state.history.append(Message("ai", llm_response))
-    spinner_placeholder.empty()
+    if 'theme_button' not in st.session_state and user_data.get('theme_button') != "NULL":
+        st.session_state['theme_button'] = user_data['theme_button']
 
-def clear_text():
-    st.session_state.human_prompt = ""
+    if 'selected_model' not in st.session_state and user_data.get('selected_model') != "NULL":
+        st.session_state['selected_model'] = user_data['selected_model']
+
+    if 'current_chat' not in st.session_state and user_data.get('current_chat') != "NULL":
+        st.session_state['current_chat'] = user_data['current_chat']
+        st.session_state['messages'] = load_chat(user_data['current_chat'])
+    
+    else:
+        if 'theme_button' not in st.session_state:
+            st.session_state['theme_button'] = 'light'
+
+        if 'selected_model' not in st.session_state:
+            st.session_state['selected_model'] = 'Mistral'
+
+        if 'current_chat' not in st.session_state:
+            st.session_state['current_chat'] = None
 
 load_css()
-initialize_session_state()
+chat_list = list_chats()
+folders = load_folders()
 
-# Сайдбар меню
-st.logo("static/img/robot.png", size="large")
-with st.sidebar:
-        if st.session_state['authentication_status']:
-            with st.container(key="login-options"):
-                st.write(f'**Добро пожаловать, {st.session_state["name"]}!**')
-                st.write(f'Роли: {", ".join(st.session_state["roles"])}.')
+# Отображение интерфейса в случае успешной авторизации
+if st.session_state['authentication_status']:
+    initialize_session_state(st.session_state["username"])
+    update_user_params(st.session_state["username"], logged_in_status=1)
+
+    # Сайдбар меню
+    st.logo("static/img/robot.png", size="large")
+    with st.sidebar:
+        with st.container(key="profile"):
+            with st.popover("Настройки"):
+                # Основная информация о пользователе
+                st.write(f'**Имя пользователя:** {st.session_state["username"]}')
+                if st.session_state.get("roles") == "NULL":
+                    st.write('**Роли:** не назначены.')
+                else:
+                    st.write(f'**Роли:** {st.session_state["roles"]}.')
+
+                # Изменение модели
+                model_radio = st.radio(
+                    "**LLM модель:**",
+                    options=list(model_options.keys()),
+                    index=list(model_options.keys()).index(st.session_state['selected_model']),
+                    format_func=lambda x: x,
+                    horizontal=True
+                )
+                API_URL = model_options[model_radio]
+
+                if model_radio != st.session_state['selected_model']:
+                    st.session_state['selected_model'] = model_radio
+                    update_user_params(st.session_state["username"], selected_model=st.session_state['selected_model'])
+                    st.rerun()
+
+                # Изменение темы
+                theme = st.radio(
+                    "**Тема:**", 
+                    options=["Светлая", "Темная"],
+                    index=0 if st.session_state['theme_button'] == 'light' else 1, 
+                    horizontal=True
+                )
+
+                if theme == "Темная" and st.session_state['theme_button'] != 'dark':
+                    selected_theme = 'dark'
+                    st.session_state['theme_button'] = selected_theme
+                    st._config.set_option('theme.base', selected_theme)
+                    update_user_params(st.session_state["username"], theme_button=st.session_state['theme_button'])
+                    st.rerun()
+                
+                if theme == "Светлая" and st.session_state['theme_button'] != 'light':
+                    selected_theme = 'light'
+                    st.session_state['theme_button'] = selected_theme
+                    st._config.set_option('theme.base', selected_theme)
+                    update_user_params(st.session_state["username"], theme_button=st.session_state['theme_button'])
+                    st.rerun()
+
+                # Выход с приложения
+                st.session_state['last_user'] = st.session_state['username']
                 authenticator.logout("Выйти")
+                # Изменение статуса входа пользователя на False в случае выхода
+                if st.session_state['username'] == None:
+                    update_user_params(st.session_state['last_user'], logged_in_status=0)
 
-            with st.container(key="chat-list"):
-                st.subheader("Список чатов")
-                chat_list = ["Чат 1", "Чат 2", "Чат 3", "Расскажи мне про город Санкт-Петербург."]
+        # Поиск чата
+        with st.container(key="search_query"):
+            search_query = st.text_area("Поиск по содержимому чатов", key="chat_search", placeholder="Поиск чата", label_visibility="hidden", height=68)
+            st.session_state['filtered_chats'] = []
+
+            filtered_chats_placeholder = st.container(key="filtered_chats")
+            no_chats_founded = st.container(key="no_chats_founded")
+
+            if not "last_search_query" in st.session_state:
+                st.session_state["last_search_query"] = search_query
+            
+            if st.session_state["last_search_query"] != search_query:
+                st.session_state["last_search_query"] = search_query
+                filtered_chats_placeholder.empty()
+                st.rerun()
+
+            if search_query:
                 for chat in chat_list:
-                    st.markdown(f'<p>{chat}</p>', unsafe_allow_html=True)
-        else:
-            tab1, tab2 = st.tabs(["**Вход**", "**Регистрация**"])
+                    chat_messages = load_chat(chat)
+                    if any(search_query.lower() in message["content"].lower() for message in chat_messages if "content" in message):
+                        st.session_state['filtered_chats'].append(chat)
 
-            with tab1:
-                try:
-                    authenticator.login(fields={
-                        'Form name': 'Вход',
-                        'Username': 'Имя пользователя',
-                        'Password': 'Пароль',
-                        'Login': 'Войти',
-                        'Captcha': 'Капча'
-                    })
+                if st.session_state['filtered_chats']:
+                    with filtered_chats_placeholder:
+                        with st.popover("Результаты поиска"):
+                            for idx, chat in enumerate(st.session_state['filtered_chats']):
+                                is_current_chat = st.session_state['current_chat'] == chat
+                                chat_content = load_chat(chat)[0]['content']
 
-                    if st.session_state["authentication_status"] == False:
-                        st.error('Имя пользователя/пароль введены неверно.')
+                                match = re.match(r'([^.!?]*[.!?])', chat_content)
+                                if match:
+                                    first_sentence = match.group(0).strip()
+                                else:
+                                    first_sentence = chat_content[:75]
+                                    
+                                button = st.button(
+                                    first_sentence.strip(),
+                                    key=f"finded_chat-{idx}", 
+                                    type="secondary",
+                                    disabled=is_current_chat
+                                )
+                                if button and not is_current_chat:
+                                    st.session_state['current_chat'] = chat
+                                    st.session_state['messages'] = load_chat(chat)
+                                    update_user_params(st.session_state["username"], current_chat=st.session_state['current_chat'])
+                                    st.markdown(
+                                        """
+                                        <div class="spinner-container">
+                                            <div class="spinner"></div>
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
+                                    time.sleep(1)
+                                    st.markdown("<meta http-equiv='refresh' content='0'>", unsafe_allow_html=True)
+                else:
+                    with filtered_chats_placeholder:
+                        st.write("Не найдено чатов по вашему запросу")
 
-                except Exception as e:
-                    st.error(e)
+        # Менеджер папок
+        with st.container(key="folder_manager"):
+            with st.popover("Менеджер папок"):
+                st.write("### Управление папками")
 
-            with tab2:
-                try:
-                    authenticator.register_user(fields={
-                        'Form name': 'Регистрация',
-                        'Username': 'Имя пользователя',
-                        'Email': 'Email',
-                        'Password': 'Пароль',
-                        'Email': 'Почта',
-                        'Repeat password': 'Повторите пароль',
-                        'Register': 'Зарегистрироваться',
-                        'Password hint': 'Подсказка пароля',
-                        'Captcha': 'Капча',
-                        'First name': 'Имя',
-                        'Last name': 'Фамилия'
-                    })
-                except Exception as e:
-                    st.error(e)
+                new_folder_name = st.text_input("Название новой папки")
+                if st.button("Создать папку"):
+                    if new_folder_name:
+                        if add_folder(folders, new_folder_name):
+                            st.rerun()
+                        else:
+                            st.error(f"Папка '{new_folder_name}' уже существует.")
 
-# Реализация чат-бот интерфейса с помощью Streamlit
-st.title("LLM бот")
-chat_placeholder = st.container()
-spinner_placeholder = st.empty()
-prompt_placeholder = st.form("chat-form")
-credit_card_placeholder = st.empty()
+                folder_to_remove = st.selectbox("Выберите папку для удаления", [folder['folder_name'] for folder in folders] + [""])
+                if st.button("Удалить папку"):
+                    if folder_to_remove:
+                        remove_folder(folders, folder_to_remove)
+                        st.rerun()
 
-with chat_placeholder:
-    st.markdown("""
-    <div class="chat-row">
-        <img class="chat-icon" src="app/static/img/ai_icon.png">
-        <div class="chat-bubble ai-bubble">
-            Привет! Чем могу помочь?
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-        
-    for chat in st.session_state.history:
-        div = f"""
-        <div class="chat-row 
-            {'' if chat.origin == 'ai' else 'row-reverse'}">
-            <img class="chat-icon" src="app/static/img/{
-                'ai_icon.png' if chat.origin == 'ai' 
-                            else 'user_icon.png'}">
-            <div class="chat-bubble
-            {'ai-bubble' if chat.origin == 'ai' else 'human-bubble'}">
-                {chat.message}
-            </div>
-        </div>
-        """
-        st.markdown(div, unsafe_allow_html=True)
-    
-    for _ in range(3):
-        st.markdown("")
+                folder_placeholder = st.empty()
+                with folder_placeholder:
+                    st.write("### Существующие папки")
+                    for folder in folders:
+                        with st.expander(folder['folder_name']):
+                            cols = st.columns([5, 1])
+                            for chat in folder['chats']:
+                                with cols[0]:
+                                    st.button(chat['chat_name'])
+                                with cols[1]:
+                                    if st.button(f"❌", key=f"remove_{chat['chat_name']}"):
+                                        remove_chat_from_folder(folders, folder['folder_name'], chat['chat_name'])
+                                        st.rerun()
 
-with prompt_placeholder:
-    st.markdown("""<h3>Введите ваш запрос:</h3>""", unsafe_allow_html=True)
-    
-    st.text_area(
-        "Чат",
-        value="",
-        label_visibility="collapsed",
-        key="human_prompt",
-        height=100
-    )
-    
-    col1, col2, col3 = st.columns([3, 1, 1])
-    
-    with col2:
-        st.form_submit_button("Стереть", on_click=clear_text, use_container_width=True)
-    
-    with col3:
-        st.form_submit_button(
-            "Отправить", 
-            type="primary", 
-            on_click=on_click_callback,
-            use_container_width=True
-        )
-
-
-credit_card_placeholder.caption(f"""
-Debug: 
-{[msg.message for msg in st.session_state.history]}
-""")
-
-components.html(
-    """
-    <script>
-   
-    document.addEventListener('DOMContentLoaded', function() {
-        const textareas = window.parent.document.querySelectorAll('.stTextArea textarea');
-        textareas.forEach(textarea => {
-            textarea.setAttribute('placeholder', 'Место для текста');
-        });
-    });
+                            new_chat_selectbox = st.selectbox(
+                                f"Выберите чат для добавления в {folder['folder_name']}", 
+                                chat_list, 
+                                key=f"{folder['folder_name']}_select", 
+                            )
+                            if st.button(f"Добавить чат в {folder['folder_name']}"):
+                                selected_chat = new_chat_selectbox
+                                if add_chat_to_folder(folders, folder['folder_name'], selected_chat):
+                                    st.rerun()  
                     
-    </script>
-    """,
-    height=0,
-    width=0
-)
+        # Список всех чатов
+        with st.container(key="chat-list"):
+            st.subheader("Список чатов")
+            if st.button("Создать новый чат", key=f"new_chat", type="primary"):
+                new_chat_name = create_new_chat()
+                st.session_state['current_chat'] = new_chat_name
+                st.session_state['messages'] = []
+                update_user_params(st.session_state["username"], current_chat=st.session_state['current_chat'])
+
+            if chat_list:
+                for idx, chat in enumerate(chat_list):
+                    is_current_chat = st.session_state['current_chat'] == chat
+                    button = st.button(
+                        load_chat(chat)[0]['content'][:100], 
+                        key=f"chat-{idx}", 
+                        type="secondary",
+                        disabled=is_current_chat
+                    )
+                    if button and not is_current_chat:
+                        st.session_state.messages = []
+                        st.session_state['current_chat'] = chat
+                        st.session_state['messages'] = load_chat(chat)
+                        update_user_params(st.session_state["username"], current_chat=st.session_state['current_chat'])
+                        st.markdown(
+                            """
+                            <div class="spinner-container">
+                                <div class="spinner"></div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        time.sleep(1)
+                        st.markdown("<meta http-equiv='refresh' content='0'>", unsafe_allow_html=True)
+
+    # Реализация чат-бот интерфейса с помощью Streamlit
+    chat_placeholder = st.container()
+    title_placeholder = st.empty()
+    popular_prompt_placeholder = st.empty()
+    interface_placeholder = st.container(key="interface")
+    spinner_placeholder = st.container()
+    
+    if not st.session_state['current_chat']:
+        st.session_state['current_chat'] = create_new_chat()
+    if 'popular_prompt' not in st.session_state:
+        st.session_state['popular_prompt'] = None
+
+    # Контейнер для всего интерфейса
+    with interface_placeholder:
+        # Контейнер для сообщений чата
+        with chat_placeholder:
+            if not st.session_state['messages']:
+                title_placeholder.title("Добро пожаловать!")
+                with popular_prompt_placeholder.expander("Примеры популярных запросов"):
+                    if st.button("Какая сегодня погода в Санкт-Петербурге?"):
+                        st.session_state['popular_prompt'] = "Какая сегодня погода в Санкт-Петербурге?"
+                    if st.button("Расскажи мне о языке Python."):
+                        st.session_state['popular_prompt'] = "Расскажи мне о языке Python."
+                    if st.button("Можешь ли ты сделать мне отчет в .xslx формате?"):
+                        st.session_state['popular_prompt'] = "Можешь ли ты сделать мне отчет в .xslx формате?"
+
+            if st.session_state['messages']:
+                for message in st.session_state['messages']:
+                    with st.chat_message(message["role"]):
+                        if "content" in message:
+                            st.markdown(message["content"])
+                        if "image" in message:
+                            st.image(resize_image(base64_to_bytes(message["image"]), 400))
+                        if "file" in message:
+                            process_file_from_json(message["file"])
+
+        # Изменение модели
+        model_selectbox = st.selectbox(
+            "**LLM модель:**",
+            options=list(model_options.keys()),
+            index=list(model_options.keys()).index(st.session_state['selected_model']),
+            format_func=lambda x: x,
+            label_visibility = "hidden"
+        )
+        API_URL = model_options[model_selectbox]
+
+        if model_selectbox != st.session_state['selected_model']:
+            st.session_state['selected_model'] = model_selectbox
+            update_user_params(st.session_state["username"], selected_model=st.session_state['selected_model'])
+            st.rerun()
+
+        # Вывод запроса пользователя на экран (выбранного популярного/введенного)
+        if "popular_prompt" in st.session_state and st.session_state['popular_prompt']:
+            prompt = st.session_state['popular_prompt']
+            st.session_state['popular_prompt'] = None
+        else:
+            prompt = st.chat_input("Введите ваш запрос")
+
+        if prompt:
+            huggingface_chain = HuggingFaceAPIChain(api_url=API_URL, api_headers=HEADERS)
+            
+            st.session_state['messages'].append({"role": "user", "content": prompt})
+            title_placeholder.empty()
+            popular_prompt_placeholder.empty()
+
+            with chat_placeholder:
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+            with spinner_placeholder:
+                with st.spinner("Обработка запроса"):
+                    chain_call = huggingface_chain._call({"input": prompt})
+                    llm_response = chain_call["output"]
+            spinner_placeholder.empty()
+            
+            if isinstance(llm_response, str):
+                st.session_state['messages'].append({"role": "assistant", "content": llm_response})
+                with chat_placeholder:
+                    with st.chat_message("assistant"):
+                        st.markdown(llm_response)
+
+            if isinstance(llm_response, bytes):
+                st.session_state['messages'].append({"role": "assistant", "image": bytes_to_base64(llm_response)})
+                with chat_placeholder:
+                    with st.chat_message("assistant"):
+                        st.image(resize_image(llm_response, 200))
+            
+            if isinstance(llm_response, dict) and "file" in llm_response:
+                file_info = llm_response["file"]
+                file_type = file_info["type"]
+                file_name = file_info["name"]
+                file_url = file_info["file_url"]
+
+                st.session_state['messages'].append({
+                    "role": "assistant",
+                    "file": {"type": file_type, "name": file_name, "file_url": file_url}
+                })
+
+    # Кнопки для работы с чатом (загрузка файлов, удаление чата)
+    with st.container(key="chat-widgets"):
+        uploaded_files = st.file_uploader("Загрузить файлы", type=None, accept_multiple_files=True)
+        if st.session_state['messages']:
+            if st.button("Удалить чат", key = "delete-chat", type="primary"):
+                st.session_state['messages'].clear()
+                clear_chat(st.session_state['current_chat'])
+                st.rerun()
+
+    if st.session_state['current_chat'] and st.session_state['messages'] != []:
+        save_chat(st.session_state['current_chat'], st.session_state['messages'])
+        chat_list = list_chats()
+        st.rerun()
+
+    if uploaded_files:
+        file_names = ", ".join(uploaded_file.name for uploaded_file in uploaded_files)
+        st.write("Названия файлов:", file_names)
+        st.session_state.messages
+
+
+# Вход и регистрация
+else:
+    tab1, tab2 = st.tabs(["**Вход**", "**Регистрация**"])
+
+    with tab1:
+        try:
+            authenticator.login(fields={
+                'Form name': 'Вход',
+                'Username': 'Имя пользователя',
+                'Password': 'Пароль',
+                'Login': 'Войти',
+                'Captcha': 'Капча'
+            })
+
+            if st.session_state["authentication_status"] == False:
+                st.error('Имя пользователя/пароль введены неверно.')
+
+        except Exception as e:
+            st.error(e)
+
+    with tab2:
+        try:
+            user_registered = authenticator.register_user(fields={
+                'Form name': 'Регистрация',
+                'Username': 'Имя пользователя',
+                'Email': 'Email',
+                'Password': 'Пароль',
+                'Email': 'Почта',
+                'Repeat password': 'Повторите пароль',
+                'Register': 'Зарегистрироваться',
+                'Password hint': 'Подсказка пароля',
+                'Captcha': 'Капча',
+                'First name': 'Имя',
+                'Last name': 'Фамилия'
+            }, captcha=False)
+
+            if user_registered != (None, None, None):
+                st.success("Пользователь успешно зарегистрирован.")
+
+        except Exception as e:
+            st.error(e)
