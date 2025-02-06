@@ -1,4 +1,9 @@
+[runner]
+magicEnabled = false
+[browser]
+gatherUsageStats = false
 [server]
 enableStaticServing = true
-[theme]
-base="light"
+headless = true
+[ui]
+hideTopBar = true
